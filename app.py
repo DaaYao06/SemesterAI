@@ -31,19 +31,111 @@ st.set_page_config(
 # SUPABASE CONNECTION
 # --------------------------------------------------
 
-@st.cache_resource
 def init_supabase():
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
-supabase = init_supabase()
 
-try:
-    supabase.table("assignments").select("*").limit(1).execute()
-    st.success("✅ Supabase connected successfully!")
-except Exception as e:
-    st.error(f"❌ Supabase connection failed: {e}")
+if "supabase" not in st.session_state:
+    st.session_state.supabase = init_supabase()
+
+supabase = st.session_state.supabase
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+# --------------------------------------------------
+# AUTHENTICATION
+# --------------------------------------------------
+
+if st.session_state.user is None:
+
+    st.title("🎓 SemesterAI")
+    st.subheader("Login or Create an Account")
+
+    login_tab, signup_tab = st.tabs(
+        ["Login", "Sign Up"]
+    )
+
+    with login_tab:
+        login_email = st.text_input(
+            "Email",
+            key="login_email"
+        )
+
+        login_password = st.text_input(
+            "Password",
+            type="password",
+            key="login_password"
+        )
+
+        if st.button(
+            "Login",
+            use_container_width=True
+        ):
+            try:
+                response = (
+                    supabase.auth.sign_in_with_password({
+                        "email": login_email,
+                        "password": login_password
+                    })
+                )
+
+                st.session_state.user = response.user
+
+                st.success("Login successful!")
+                st.rerun()
+
+            except Exception as e:
+                st.error(
+                    "Login failed. Please check your "
+                    "email and password."
+                )
+
+    with signup_tab:
+        signup_email = st.text_input(
+            "Email",
+            key="signup_email"
+        )
+
+        signup_password = st.text_input(
+            "Password",
+            type="password",
+            key="signup_password"
+        )
+
+        if st.button(
+            "Create Account",
+            use_container_width=True
+        ):
+            try:
+                response = supabase.auth.sign_up({
+                    "email": signup_email,
+                    "password": signup_password
+                })
+
+                st.success(
+                    "Account created! You can now log in."
+                )
+
+            except Exception as e:
+                st.error(
+                    "Could not create account."
+                )
+
+    st.stop()
+with st.sidebar:
+    st.write(f"Logged in as: {st.session_state.user.email}")
+
+    if st.button("Logout", use_container_width=True):
+        supabase.auth.sign_out()
+
+        st.session_state.user = None
+
+        st.session_state.pop("assignments", None)
+        st.session_state.pop("daily_hours", None)
+
+        st.rerun()        
 # --------------------------------------------------
 # SESSION STATE
 # --------------------------------------------------
@@ -53,6 +145,7 @@ if "assignments" not in st.session_state:
         response = (
             supabase.table("assignments")
             .select("*")
+            .eq("user_id", st.session_state.user.id)
             .order("due_date")
             .execute()
         )
@@ -79,6 +172,7 @@ if "daily_hours" not in st.session_state:
         response = (
             supabase.table("study_hours")
             .select("*")
+            .eq("user_id", st.session_state.user.id)
             .execute()
         )
 
@@ -367,9 +461,12 @@ with st.form("assignment_form", clear_on_submit=True):
                 "due_date": due_date,
                 "estimated_hours": float(estimated_hours),
                 "priority": priority,
-                "completed": False
+                "completed": False,
+                "user_id": st.session_state.user.id
             }
-
+            
+            st.write("Assignment user ID:", new_assignment["user_id"])
+            
             try:
                 response = supabase.table("assignments").insert({
                     "course": new_assignment["course"],
@@ -377,7 +474,8 @@ with st.form("assignment_form", clear_on_submit=True):
                     "due_date": str(new_assignment["due_date"]),
                     "estimated_hours": new_assignment["estimated_hours"],
                     "priority": new_assignment["priority"],
-                    "completed": new_assignment["completed"]
+                    "completed": new_assignment["completed"],
+                    "user_id": new_assignment["user_id"]
                 }).execute()
 
                 if response.data:
@@ -616,37 +714,36 @@ for index, day_name in enumerate(days):
         )
 
         if new_hours != old_hours:
-
             try:
                 existing = (
                     supabase.table("study_hours")
                     .select("id")
                     .eq("day_name", day_name)
+                    .eq("user_id", st.session_state.user.id)
                     .execute()
                 )
-
                 if existing.data:
-                    supabase.table("study_hours").update({
-                        "hours": float(new_hours)
-                    }).eq(
-                        "day_name",
-                        day_name
-                    ).execute()
-
+                    (
+                        supabase.table("study_hours")
+                        .update({
+                            "hours": float(new_hours)
+                        })
+                        .eq("day_name", day_name)
+                        .eq("user_id", st.session_state.user.id)
+                        .execute()
+                    )
                 else:
                     supabase.table("study_hours").insert({
                         "day_name": day_name,
-                        "hours": float(new_hours)
+                        "hours": float(new_hours),
+                        "user_id": st.session_state.user.id
                     }).execute()
+            except Exception as error:
+                st.error(f"Failed to update study hours: {error}")
 
-                st.session_state.daily_hours[
-                    day_name
-                ] = float(new_hours)
-
-            except Exception as e:
-                st.error(
-                    f"Could not save {day_name} study hours: {e}"
-                )
+        st.session_state.daily_hours[
+            day_name
+        ] = float(new_hours)
 
 
 weekly_available = sum(
