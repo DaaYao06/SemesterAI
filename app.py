@@ -140,7 +140,7 @@ def build_study_plan():
     incomplete = sorted(
         incomplete,
         key=lambda x: (
-            x["due_date"],
+            normalize_date（x["due_date"]）,
             -priority_score(x["priority"])
         )
     )
