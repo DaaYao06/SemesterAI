@@ -1,6 +1,20 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from supabase import create_client
+
+
+def normalize_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    if isinstance(value, str):
+        return datetime.strptime(value, "%Y-%m-%d").date()
+
+    return value
 
 # --------------------------------------------------
 # PAGE SETTINGS
@@ -12,15 +26,46 @@ st.set_page_config(
     layout="wide"
 )
 
+
+# --------------------------------------------------
+# SUPABASE CONNECTION
+# --------------------------------------------------
+
+@st.cache_resource
+def init_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = init_supabase()
+
+try:
+    supabase.table("assignments").select("*").limit(1).execute()
+    st.success("✅ Supabase connected successfully!")
+except Exception as e:
+    st.error(f"❌ Supabase connection failed: {e}")
 # --------------------------------------------------
 # SESSION STATE
 # --------------------------------------------------
 
 if "assignments" not in st.session_state:
-    st.session_state.assignments = []
+    try:
+        response = (
+            supabase.table("assignments")
+            .select("*")
+            .order("due_date")
+            .execute()
+        )
+
+        st.session_state.assignments = response.data
+
+    except Exception as e:
+        st.session_state.assignments = []
+        st.error(f"Could not load assignments: {e}")
 
 if "daily_hours" not in st.session_state:
-    st.session_state.daily_hours = {
+
+    default_hours = {
         "Monday": 2.0,
         "Tuesday": 2.0,
         "Wednesday": 2.0,
@@ -30,12 +75,37 @@ if "daily_hours" not in st.session_state:
         "Sunday": 3.0
     }
 
+    try:
+        response = (
+            supabase.table("study_hours")
+            .select("*")
+            .execute()
+        )
+
+        if response.data:
+            st.session_state.daily_hours = default_hours.copy()
+
+            for row in response.data:
+                st.session_state.daily_hours[
+                    row["day_name"]
+                ] = float(row["hours"])
+
+        else:
+            st.session_state.daily_hours = default_hours.copy()
+
+    except Exception as e:
+        st.session_state.daily_hours = default_hours.copy()
+        st.error(f"Could not load study hours: {e}")
+
 
 # --------------------------------------------------
 # HELPER FUNCTIONS
 # --------------------------------------------------
 
 def days_remaining(due_date):
+    if isinstance(due_date, str):
+        due_date = date.fromisoformat(due_date)
+
     return (due_date - date.today()).days
 
 
@@ -100,13 +170,13 @@ def build_study_plan():
         eligible = [
             a for a in incomplete
             if remaining_hours[a["id"]] > 0
-            and current_day <= a["due_date"]
+            and current_day <= normalize_date(a["due_date"])
         ]
 
         eligible = sorted(
             eligible,
             key=lambda x: (
-                x["due_date"],
+                normalize_date(x["due_date"]),
                 -priority_score(x["priority"])
             )
         )
@@ -183,7 +253,7 @@ if incomplete_assignments:
 
     next_assignment = min(
         incomplete_assignments,
-        key=lambda x: x["due_date"]
+        key=lambda x: normalize_date(x["due_date"])
     )
 
     next_deadline = (
@@ -291,39 +361,35 @@ with st.form("assignment_form", clear_on_submit=True):
             st.error("Please enter an assignment name.")
 
         else:
-
             new_assignment = {
-                "id": (
-                    max(
-                        [
-                            a["id"]
-                            for a
-                            in st.session_state.assignments
-                        ],
-                        default=0
-                    )
-                    + 1
-                ),
                 "course": course.strip(),
                 "assignment": assignment_name.strip(),
                 "due_date": due_date,
-                "estimated_hours": float(
-                    estimated_hours
-                ),
+                "estimated_hours": float(estimated_hours),
                 "priority": priority,
                 "completed": False
             }
 
-            st.session_state.assignments.append(
-                new_assignment
-            )
+            try:
+                response = supabase.table("assignments").insert({
+                    "course": new_assignment["course"],
+                    "assignment": new_assignment["assignment"],
+                    "due_date": str(new_assignment["due_date"]),
+                    "estimated_hours": new_assignment["estimated_hours"],
+                    "priority": new_assignment["priority"],
+                    "completed": new_assignment["completed"]
+                }).execute()
 
-            st.success("Assignment added!")
+                if response.data:
+                    st.session_state.assignments.append(
+                        response.data[0]
+                    )
 
-            st.rerun()
+                    st.success("Assignment saved to Supabase!")
+                    st.rerun()
 
-
-st.divider()
+            except Exception as e:
+                st.error(f"Could not save assignment: {e}")
 
 
 # --------------------------------------------------
@@ -345,7 +411,7 @@ else:
         st.session_state.assignments,
         key=lambda x: (
             x["completed"],
-            x["due_date"]
+            normalize_date(x["due_date"])
         )
     )
 
@@ -385,9 +451,26 @@ else:
                         key=f'undo_{assignment["id"]}',
                         use_container_width=True
                     ):
+                        try:
+                            supabase.table("assignments").update({
+                                "completed": False
+                            }).eq(
+                                "id",
+                                assignment["id"]
+                            ).execute()
 
-                        assignment["completed"] = False
-                        st.rerun()
+                            assignment["completed"] = False
+
+                            st.success(
+                                "Assignment marked as incomplete."
+                            )
+
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(
+                                f"Could not update assignment: {e}"
+                            )
 
                 else:
 
@@ -396,16 +479,37 @@ else:
                         key=f'complete_{assignment["id"]}',
                         use_container_width=True
                     ):
+                        try:
+                            supabase.table("assignments").update({
+                                "completed": True
+                            }).eq(
+                                "id",
+                                assignment["id"]
+                            ).execute()
 
-                        assignment["completed"] = True
-                        st.rerun()
+                            assignment["completed"] = True
+
+                            st.success(
+                                "Assignment completed!"
+                            )
+
+                            st.rerun()
+
+                        except Exception as e:
+                            st.error(
+                                f"Could not update assignment: {e}"
+                            )
+
+            due_date_value = assignment["due_date"]
+
+            if isinstance(due_date_value, str):
+                due_date_value = date.fromisoformat(due_date_value)
 
             st.write(
-                "📅 Due:",
-                assignment["due_date"].strftime(
-                    "%B %d, %Y"
-                )
-            )
+               "📅 Due:",
+               due_date_value.strftime("%B %d, %Y")
+)
+
 
             st.write(
                 "⏱ Estimated time:",
@@ -446,17 +550,27 @@ else:
                 )
 
             if st.button(
-                "Delete Assignment",
-                key=f'delete_{assignment["id"]}'
+               "Delete Assignment",
+               key=f'delete_{assignment["id"]}'
             ):
+               try:
+                   supabase.table("assignments").delete().eq(
+                       "id",
+                       assignment["id"]
+                   ).execute()
 
-                st.session_state.assignments = [
-                    a
-                    for a in st.session_state.assignments
-                    if a["id"] != assignment["id"]
-                ]
+                   st.session_state.assignments = [
+                       a
+                       for a in st.session_state.assignments
+                       if a["id"] != assignment["id"]
+                   ]
 
-                st.rerun()
+                   st.rerun()
+
+               except Exception as e:
+                   st.error(
+                       f"Could not delete assignment: {e}"
+                   )
 
 
 st.divider()
@@ -488,20 +602,51 @@ for index, day_name in enumerate(days):
 
     with day_columns[index]:
 
-        st.session_state.daily_hours[day_name] = (
-            st.number_input(
-                day_name[:3],
-                min_value=0.0,
-                max_value=12.0,
-                value=float(
-                    st.session_state.daily_hours[
-                        day_name
-                    ]
-                ),
-                step=0.5,
-                key=f"hours_{day_name}"
-            )
+        old_hours = float(
+            st.session_state.daily_hours[day_name]
         )
+
+        new_hours = st.number_input(
+            day_name[:3],
+            min_value=0.0,
+            max_value=12.0,
+            value=old_hours,
+            step=0.5,
+            key=f"hours_{day_name}"
+        )
+
+        if new_hours != old_hours:
+
+            try:
+                existing = (
+                    supabase.table("study_hours")
+                    .select("id")
+                    .eq("day_name", day_name)
+                    .execute()
+                )
+
+                if existing.data:
+                    supabase.table("study_hours").update({
+                        "hours": float(new_hours)
+                    }).eq(
+                        "day_name",
+                        day_name
+                    ).execute()
+
+                else:
+                    supabase.table("study_hours").insert({
+                        "day_name": day_name,
+                        "hours": float(new_hours)
+                    }).execute()
+
+                st.session_state.daily_hours[
+                    day_name
+                ] = float(new_hours)
+
+            except Exception as e:
+                st.error(
+                    f"Could not save {day_name} study hours: {e}"
+                )
 
 
 weekly_available = sum(
@@ -640,9 +785,9 @@ if st.session_state.assignments:
         export_data.append({
             "Course": assignment["course"],
             "Assignment": assignment["assignment"],
-            "Due Date": assignment[
-                "due_date"
-            ].strftime("%Y-%m-%d"),
+            "Due Date": normalize_date(
+                assignment["due_date"]
+            ).strftime("%Y-%m-%d"),
             "Estimated Hours": assignment[
                 "estimated_hours"
             ],
